@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: spider-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: spider
+      POSTGRES_PASSWORD: spider_secure_pass
+      POSTGRES_DB: spider_freight
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./internal/db/migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spider -d spider_freight"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spider-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=spider
+      - DB_PASSWORD=spider_secure_pass
+      - DB_NAME=spider_freight
+      - DB_SSLMODE=disable
+      - JWT_SECRET=super_spider_jwt_secret_for_dev_change_in_prod_123456
+      - RAZORPAY_KEY_ID=rzp_test_dummy
+      - RAZORPAY_KEY_SECRET=rzp_test_secret_dummy
+      - RAZORPAY_WEBHOOK_SECRET=rzp_webhook_secret_dummy
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
