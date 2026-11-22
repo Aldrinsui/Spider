@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -345,7 +346,6 @@ func (m *MockBookingRepository) HoldSpaceTransaction(ctx context.Context, b *dom
 		return fmt.Errorf("insufficient payload weight: requested %.2f kg, available %.2f kg", b.ActualWeightKG, container.AvailableWeightKG)
 	}
 
-	// Decrement container atomically
 	container.AvailableCBM -= b.ChargeableVolumeCBM
 	container.AvailableWeightKG -= b.ActualWeightKG
 
@@ -498,4 +498,187 @@ func (m *MockOutboxRepository) MarkEventFailed(ctx context.Context, id uuid.UUID
 		}
 	}
 	return errors.New("event not found")
+}
+
+type MockEscrowRepository struct {
+	mu            sync.Mutex
+	escrows       map[uuid.UUID]*domain.PaymentEscrow
+	processedPay  map[string]bool
+	bookingRepo   *MockBookingRepository
+	containerRepo *MockContainerRepository
+	outboxRepo    *MockOutboxRepository
+}
+
+func NewMockEscrowRepository(bookingRepo *MockBookingRepository, containerRepo *MockContainerRepository, outboxRepo *MockOutboxRepository) repository.EscrowRepository {
+	return &MockEscrowRepository{
+		escrows:       make(map[uuid.UUID]*domain.PaymentEscrow),
+		processedPay:  make(map[string]bool),
+		bookingRepo:   bookingRepo,
+		containerRepo: containerRepo,
+		outboxRepo:    outboxRepo,
+	}
+}
+
+func (m *MockEscrowRepository) CreatePaymentEscrow(ctx context.Context, e *domain.PaymentEscrow) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e.ID == uuid.Nil {
+		e.ID = uuid.New()
+	}
+	e.CreatedAt = time.Now()
+	e.UpdatedAt = time.Now()
+	m.escrows[e.BookingID] = e
+	return nil
+}
+
+func (m *MockEscrowRepository) GetEscrowByBookingID(ctx context.Context, bookingID uuid.UUID) (*domain.PaymentEscrow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.escrows[bookingID]; ok {
+		return e, nil
+	}
+	return nil, nil
+}
+
+func (m *MockEscrowRepository) GetEscrowByOrderID(ctx context.Context, orderID string) (*domain.PaymentEscrow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.escrows {
+		if e.RazorpayOrderID == orderID {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockEscrowRepository) IsWebhookProcessed(ctx context.Context, paymentID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.processedPay[paymentID], nil
+}
+
+func (m *MockEscrowRepository) RecordProcessedWebhook(ctx context.Context, eventID, paymentID, eventType string, payload json.RawMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.processedPay[paymentID] = true
+	return nil
+}
+
+func (m *MockEscrowRepository) ConfirmPaymentAndHoldEscrow(ctx context.Context, bookingID uuid.UUID, paymentID, signature, routeTransferID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b, ok := m.bookingRepo.bookings[bookingID]
+	if !ok {
+		return errors.New("booking not found")
+	}
+	b.Status = domain.BookingStatusConfirmed
+	now := time.Now()
+	b.ConfirmedAt = &now
+
+	e, ok := m.escrows[bookingID]
+	if !ok {
+		return errors.New("escrow not found")
+	}
+	e.RazorpayPaymentID = paymentID
+	e.RazorpaySignature = signature
+	e.ProviderRouteTransferID = routeTransferID
+	e.EscrowStatus = domain.EscrowStatusHeld
+
+	if m.outboxRepo != nil {
+		m.outboxRepo.events = append(m.outboxRepo.events, domain.OutboxEvent{
+			ID:          uuid.New(),
+			EventType:   "booking.confirmed",
+			AggregateID: bookingID,
+			Status:      domain.OutboxStatusPending,
+			CreatedAt:   now,
+		})
+	}
+
+	return nil
+}
+
+func (m *MockEscrowRepository) ReconcileLatePayment(ctx context.Context, bookingID uuid.UUID, paymentID, signature string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b, ok := m.bookingRepo.bookings[bookingID]
+	if !ok {
+		return false, errors.New("booking not found")
+	}
+	c, ok := m.containerRepo.containers[b.ContainerID]
+	if !ok {
+		return false, errors.New("container not found")
+	}
+	e, ok := m.escrows[bookingID]
+	if !ok {
+		return false, errors.New("escrow not found")
+	}
+
+	e.RazorpayPaymentID = paymentID
+	e.RazorpaySignature = signature
+
+	// Check if space is still free
+	if c.AvailableCBM >= b.ChargeableVolumeCBM && c.AvailableWeightKG >= b.ActualWeightKG {
+		c.AvailableCBM -= b.ChargeableVolumeCBM
+		c.AvailableWeightKG -= b.ActualWeightKG
+		b.Status = domain.BookingStatusConfirmed
+		now := time.Now()
+		b.ConfirmedAt = &now
+		e.EscrowStatus = domain.EscrowStatusHeld
+		return true, nil // Confirmed late
+	}
+
+	// Space no longer free -> auto refund
+	b.Status = domain.BookingStatusRefunded
+	now := time.Now()
+	e.EscrowStatus = domain.EscrowStatusRefundedToTrader
+	e.RefundedAt = &now
+	return false, nil // Refunded
+}
+
+func (m *MockEscrowRepository) ReleaseEscrowPayout(ctx context.Context, bookingID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	e, ok := m.escrows[bookingID]
+	if !ok {
+		return errors.New("escrow not found")
+	}
+	if e.EscrowStatus != domain.EscrowStatusHeld {
+		return errors.New("escrow is not held")
+	}
+	now := time.Now()
+	e.EscrowStatus = domain.EscrowStatusReleasedToProvider
+	e.PayoutReleasedAt = &now
+	return nil
+}
+
+func (m *MockEscrowRepository) ProcessRefund(ctx context.Context, bookingID uuid.UUID, refundID string, refundAmountPaise int64, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b, ok := m.bookingRepo.bookings[bookingID]
+	if !ok {
+		return errors.New("booking not found")
+	}
+	b.Status = domain.BookingStatusCancelled
+	now := time.Now()
+	b.CancelledAt = &now
+
+	e, ok := m.escrows[bookingID]
+	if !ok {
+		return errors.New("escrow not found")
+	}
+	e.EscrowStatus = domain.EscrowStatusRefundedToTrader
+	e.RefundID = refundID
+	e.RefundAmountPaise = &refundAmountPaise
+	e.RefundedAt = &now
+
+	if c, ok := m.containerRepo.containers[b.ContainerID]; ok {
+		c.AvailableCBM += b.ChargeableVolumeCBM
+		c.AvailableWeightKG += b.ActualWeightKG
+	}
+
+	return nil
 }
