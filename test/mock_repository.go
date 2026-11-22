@@ -618,7 +618,6 @@ func (m *MockEscrowRepository) ReconcileLatePayment(ctx context.Context, booking
 	e.RazorpayPaymentID = paymentID
 	e.RazorpaySignature = signature
 
-	// Check if space is still free
 	if c.AvailableCBM >= b.ChargeableVolumeCBM && c.AvailableWeightKG >= b.ActualWeightKG {
 		c.AvailableCBM -= b.ChargeableVolumeCBM
 		c.AvailableWeightKG -= b.ActualWeightKG
@@ -626,15 +625,14 @@ func (m *MockEscrowRepository) ReconcileLatePayment(ctx context.Context, booking
 		now := time.Now()
 		b.ConfirmedAt = &now
 		e.EscrowStatus = domain.EscrowStatusHeld
-		return true, nil // Confirmed late
+		return true, nil
 	}
 
-	// Space no longer free -> auto refund
 	b.Status = domain.BookingStatusRefunded
 	now := time.Now()
 	e.EscrowStatus = domain.EscrowStatusRefundedToTrader
 	e.RefundedAt = &now
-	return false, nil // Refunded
+	return false, nil
 }
 
 func (m *MockEscrowRepository) ReleaseEscrowPayout(ctx context.Context, bookingID uuid.UUID) error {
@@ -680,5 +678,56 @@ func (m *MockEscrowRepository) ProcessRefund(ctx context.Context, bookingID uuid
 		c.AvailableWeightKG += b.ActualWeightKG
 	}
 
+	return nil
+}
+
+type MockChatRepository struct {
+	mu       sync.Mutex
+	messages map[uuid.UUID][]domain.ChatMessage
+}
+
+func NewMockChatRepository() repository.ChatRepository {
+	return &MockChatRepository{
+		messages: make(map[uuid.UUID][]domain.ChatMessage),
+	}
+}
+
+func (m *MockChatRepository) SendMessage(ctx context.Context, msg *domain.ChatMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if msg.ID == uuid.Nil {
+		msg.ID = uuid.New()
+	}
+	msg.CreatedAt = time.Now()
+	m.messages[msg.BookingID] = append(m.messages[msg.BookingID], *msg)
+	return nil
+}
+
+func (m *MockChatRepository) ListMessages(ctx context.Context, bookingID uuid.UUID, limit int, before *time.Time) ([]domain.ChatMessage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	all := m.messages[bookingID]
+	var res []domain.ChatMessage
+	for _, msg := range all {
+		if before != nil && !msg.CreatedAt.Before(*before) {
+			continue
+		}
+		res = append(res, msg)
+		if len(res) >= limit {
+			break
+		}
+	}
+	return res, nil
+}
+
+func (m *MockChatRepository) MarkMessagesAsRead(ctx context.Context, bookingID uuid.UUID, readerID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.messages[bookingID] {
+		if m.messages[bookingID][i].SenderID != readerID {
+			m.messages[bookingID][i].IsRead = true
+		}
+	}
 	return nil
 }
