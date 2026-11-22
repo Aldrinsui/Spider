@@ -731,3 +731,178 @@ func (m *MockChatRepository) MarkMessagesAsRead(ctx context.Context, bookingID u
 	}
 	return nil
 }
+
+type MockDocumentRepository struct {
+	mu   sync.Mutex
+	docs map[uuid.UUID][]repository.DocumentVaultItem
+}
+
+func NewMockDocumentRepository() repository.DocumentRepository {
+	return &MockDocumentRepository{
+		docs: make(map[uuid.UUID][]repository.DocumentVaultItem),
+	}
+}
+
+func (m *MockDocumentRepository) AddDocument(ctx context.Context, doc *repository.DocumentVaultItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if doc.ID == uuid.Nil {
+		doc.ID = uuid.New()
+	}
+	doc.CreatedAt = time.Now()
+	m.docs[doc.BookingID] = append(m.docs[doc.BookingID], *doc)
+	return nil
+}
+
+func (m *MockDocumentRepository) ListDocumentsByBooking(ctx context.Context, bookingID uuid.UUID) ([]repository.DocumentVaultItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.docs[bookingID], nil
+}
+
+type MockTrackingRepository struct {
+	mu            sync.Mutex
+	proofs        map[uuid.UUID]*repository.DeliveryProof
+	bookingRepo   *MockBookingRepository
+	escrowRepo    *MockEscrowRepository
+	containerRepo *MockContainerRepository
+}
+
+func NewMockTrackingRepository(bookingRepo *MockBookingRepository, escrowRepo *MockEscrowRepository, containerRepo *MockContainerRepository) repository.TrackingRepository {
+	return &MockTrackingRepository{
+		proofs:        make(map[uuid.UUID]*repository.DeliveryProof),
+		bookingRepo:   bookingRepo,
+		escrowRepo:    escrowRepo,
+		containerRepo: containerRepo,
+	}
+}
+
+func (m *MockTrackingRepository) UpdateContainerLocation(ctx context.Context, containerID uuid.UUID, lat, lng float64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.containerRepo.containers[containerID]; ok {
+		c.CurrentLocation = &domain.LocationPoint{Latitude: lat, Longitude: lng}
+		now := time.Now()
+		c.LastLocationUpdatedAt = &now
+		return nil
+	}
+	return errors.New("container not found")
+}
+
+func (m *MockTrackingRepository) SubmitDeliveryProof(ctx context.Context, proof *repository.DeliveryProof) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if proof.ID == uuid.Nil {
+		proof.ID = uuid.New()
+	}
+	proof.DeliveredAt = time.Now()
+	m.proofs[proof.BookingID] = proof
+
+	if b, ok := m.bookingRepo.bookings[proof.BookingID]; ok {
+		b.Status = domain.BookingStatusDelivered
+		now := time.Now()
+		b.DeliveredAt = &now
+	}
+	if e, ok := m.escrowRepo.escrows[proof.BookingID]; ok {
+		e.EscrowStatus = domain.EscrowStatusReleasedToProvider
+		now := time.Now()
+		e.PayoutReleasedAt = &now
+	}
+	return nil
+}
+
+func (m *MockTrackingRepository) GetDeliveryProof(ctx context.Context, bookingID uuid.UUID) (*repository.DeliveryProof, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.proofs[bookingID]; ok {
+		return p, nil
+	}
+	return nil, nil
+}
+
+type MockDisputeRepository struct {
+	mu          sync.Mutex
+	disputes    map[uuid.UUID]*repository.DisputeItem
+	bookingRepo *MockBookingRepository
+	escrowRepo  *MockEscrowRepository
+}
+
+func NewMockDisputeRepository(bookingRepo *MockBookingRepository, escrowRepo *MockEscrowRepository) repository.DisputeRepository {
+	return &MockDisputeRepository{
+		disputes:    make(map[uuid.UUID]*repository.DisputeItem),
+		bookingRepo: bookingRepo,
+		escrowRepo:  escrowRepo,
+	}
+}
+
+func (m *MockDisputeRepository) CreateDispute(ctx context.Context, d *repository.DisputeItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d.ID == uuid.Nil {
+		d.ID = uuid.New()
+	}
+	now := time.Now()
+	d.CreatedAt = now
+	d.UpdatedAt = now
+	m.disputes[d.ID] = d
+
+	if b, ok := m.bookingRepo.bookings[d.BookingID]; ok {
+		b.Status = domain.BookingStatusDisputed
+	}
+	if e, ok := m.escrowRepo.escrows[d.BookingID]; ok {
+		e.EscrowStatus = domain.EscrowStatusDisputedFreeze
+	}
+	return nil
+}
+
+func (m *MockDisputeRepository) GetDisputeByID(ctx context.Context, id uuid.UUID) (*repository.DisputeItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d, ok := m.disputes[id]; ok {
+		return d, nil
+	}
+	return nil, nil
+}
+
+func (m *MockDisputeRepository) ListDisputes(ctx context.Context, status string) ([]repository.DisputeItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []repository.DisputeItem
+	for _, d := range m.disputes {
+		if status == "" || d.Status == status {
+			res = append(res, *d)
+		}
+	}
+	return res, nil
+}
+
+func (m *MockDisputeRepository) ResolveDispute(ctx context.Context, id uuid.UUID, status string, notes string, adminID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.disputes[id]
+	if !ok {
+		return errors.New("dispute not found")
+	}
+	d.Status = status
+	d.ResolutionNotes = notes
+	d.ResolvedBy = &adminID
+	now := time.Now()
+	d.ResolvedAt = &now
+
+	if status == "resolved_refund" {
+		if b, ok := m.bookingRepo.bookings[d.BookingID]; ok {
+			b.Status = domain.BookingStatusRefunded
+		}
+		if e, ok := m.escrowRepo.escrows[d.BookingID]; ok {
+			e.EscrowStatus = domain.EscrowStatusRefundedToTrader
+		}
+	} else if status == "resolved_payout" {
+		if b, ok := m.bookingRepo.bookings[d.BookingID]; ok {
+			b.Status = domain.BookingStatusDelivered
+		}
+		if e, ok := m.escrowRepo.escrows[d.BookingID]; ok {
+			e.EscrowStatus = domain.EscrowStatusReleasedToProvider
+		}
+	}
+	return nil
+}
