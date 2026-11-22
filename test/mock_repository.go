@@ -244,3 +244,71 @@ func (m *MockAuditRepository) ListByTarget(ctx context.Context, targetType strin
 	}
 	return res, nil
 }
+
+type MockContainerRepository struct {
+	mu         sync.Mutex
+	containers map[uuid.UUID]*domain.Container
+}
+
+func NewMockContainerRepository() repository.ContainerRepository {
+	return &MockContainerRepository{
+		containers: make(map[uuid.UUID]*domain.Container),
+	}
+}
+
+func (m *MockContainerRepository) CreateContainer(ctx context.Context, c *domain.Container) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c.ID == uuid.Nil {
+		c.ID = uuid.New()
+	}
+	c.CreatedAt = time.Now()
+	c.UpdatedAt = time.Now()
+	m.containers[c.ID] = c
+	return nil
+}
+
+func (m *MockContainerRepository) GetContainerByID(ctx context.Context, id uuid.UUID) (*domain.Container, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.containers[id]; ok {
+		return c, nil
+	}
+	return nil, nil
+}
+
+func (m *MockContainerRepository) UpdateContainer(ctx context.Context, c *domain.Container) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c.UpdatedAt = time.Now()
+	m.containers[c.ID] = c
+	return nil
+}
+
+func (m *MockContainerRepository) SearchContainers(ctx context.Context, filter repository.ContainerSearchFilter) ([]domain.Container, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []domain.Container
+	for _, c := range m.containers {
+		if filter.MinCBM > 0 && c.AvailableCBM < filter.MinCBM {
+			continue
+		}
+		if filter.TransportMode != "" && string(c.TransportMode) != filter.TransportMode {
+			continue
+		}
+		res = append(res, *c)
+	}
+	return res, nil
+}
+
+func (m *MockContainerRepository) ListByProvider(ctx context.Context, providerID uuid.UUID) ([]domain.Container, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []domain.Container
+	for _, c := range m.containers {
+		if c.ProviderID == providerID {
+			res = append(res, *c)
+		}
+	}
+	return res, nil
+}
