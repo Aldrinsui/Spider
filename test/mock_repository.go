@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -311,4 +312,190 @@ func (m *MockContainerRepository) ListByProvider(ctx context.Context, providerID
 		}
 	}
 	return res, nil
+}
+
+type MockBookingRepository struct {
+	mu            sync.Mutex
+	bookings      map[uuid.UUID]*domain.Booking
+	containerRepo *MockContainerRepository
+	outboxRepo    *MockOutboxRepository
+}
+
+func NewMockBookingRepository(containerRepo *MockContainerRepository, outboxRepo *MockOutboxRepository) repository.BookingRepository {
+	return &MockBookingRepository{
+		bookings:      make(map[uuid.UUID]*domain.Booking),
+		containerRepo: containerRepo,
+		outboxRepo:    outboxRepo,
+	}
+}
+
+func (m *MockBookingRepository) HoldSpaceTransaction(ctx context.Context, b *domain.Booking, outboxEvent *domain.OutboxEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	container, ok := m.containerRepo.containers[b.ContainerID]
+	if !ok {
+		return errors.New("container not found")
+	}
+
+	if container.AvailableCBM < b.ChargeableVolumeCBM {
+		return fmt.Errorf("insufficient capacity: requested %.2f CBM, available %.2f CBM", b.ChargeableVolumeCBM, container.AvailableCBM)
+	}
+	if container.AvailableWeightKG < b.ActualWeightKG {
+		return fmt.Errorf("insufficient payload weight: requested %.2f kg, available %.2f kg", b.ActualWeightKG, container.AvailableWeightKG)
+	}
+
+	// Decrement container atomically
+	container.AvailableCBM -= b.ChargeableVolumeCBM
+	container.AvailableWeightKG -= b.ActualWeightKG
+
+	if b.ID == uuid.Nil {
+		b.ID = uuid.New()
+	}
+	now := time.Now()
+	exp := now.Add(10 * time.Minute)
+	b.Status = domain.BookingStatusHeld
+	b.HoldExpiresAt = &exp
+	b.CreatedAt = now
+	b.UpdatedAt = now
+	m.bookings[b.ID] = b
+
+	if outboxEvent != nil && m.outboxRepo != nil {
+		if outboxEvent.ID == uuid.Nil {
+			outboxEvent.ID = uuid.New()
+		}
+		outboxEvent.Status = domain.OutboxStatusPending
+		outboxEvent.CreatedAt = now
+		m.outboxRepo.events = append(m.outboxRepo.events, *outboxEvent)
+	}
+
+	return nil
+}
+
+func (m *MockBookingRepository) ReclaimExpiredHolds(ctx context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reclaimed := 0
+	now := time.Now()
+
+	for _, b := range m.bookings {
+		if b.Status == domain.BookingStatusHeld && b.HoldExpiresAt != nil && b.HoldExpiresAt.Before(now) {
+			b.Status = domain.BookingStatusExpired
+			if container, ok := m.containerRepo.containers[b.ContainerID]; ok {
+				container.AvailableCBM += b.ChargeableVolumeCBM
+				container.AvailableWeightKG += b.ActualWeightKG
+			}
+			reclaimed++
+		}
+	}
+	return reclaimed, nil
+}
+
+func (m *MockBookingRepository) GetBookingByID(ctx context.Context, id uuid.UUID) (*domain.Booking, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.bookings[id]; ok {
+		return b, nil
+	}
+	return nil, nil
+}
+
+func (m *MockBookingRepository) GetBookingByRef(ctx context.Context, ref string) (*domain.Booking, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.bookings {
+		if b.BookingRef == ref {
+			return b, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockBookingRepository) ListBookingsByTrader(ctx context.Context, traderID uuid.UUID) ([]domain.Booking, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []domain.Booking
+	for _, b := range m.bookings {
+		if b.TraderID == traderID {
+			res = append(res, *b)
+		}
+	}
+	return res, nil
+}
+
+func (m *MockBookingRepository) ListBookingsByContainer(ctx context.Context, containerID uuid.UUID) ([]domain.Booking, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []domain.Booking
+	for _, b := range m.bookings {
+		if b.ContainerID == containerID {
+			res = append(res, *b)
+		}
+	}
+	return res, nil
+}
+
+func (m *MockBookingRepository) UpdateBookingStatus(ctx context.Context, id uuid.UUID, status domain.BookingStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.bookings[id]; ok {
+		b.Status = status
+		return nil
+	}
+	return errors.New("booking not found")
+}
+
+type MockOutboxRepository struct {
+	mu     sync.Mutex
+	events []domain.OutboxEvent
+}
+
+func NewMockOutboxRepository() *MockOutboxRepository {
+	return &MockOutboxRepository{events: []domain.OutboxEvent{}}
+}
+
+func (m *MockOutboxRepository) GetPendingEvents(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res []domain.OutboxEvent
+	for _, e := range m.events {
+		if e.Status == domain.OutboxStatusPending {
+			res = append(res, e)
+			if len(res) >= limit {
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
+func (m *MockOutboxRepository) MarkEventCompleted(ctx context.Context, id uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.events {
+		if m.events[i].ID == id {
+			m.events[i].Status = domain.OutboxStatusCompleted
+			now := time.Now()
+			m.events[i].ProcessedAt = &now
+			return nil
+		}
+	}
+	return errors.New("event not found")
+}
+
+func (m *MockOutboxRepository) MarkEventFailed(ctx context.Context, id uuid.UUID, lastErr string, retryCount int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.events {
+		if m.events[i].ID == id {
+			m.events[i].LastError = lastErr
+			m.events[i].RetryCount = retryCount
+			if retryCount >= 5 {
+				m.events[i].Status = domain.OutboxStatusFailed
+			}
+			return nil
+		}
+	}
+	return errors.New("event not found")
 }
